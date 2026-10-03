@@ -123,6 +123,7 @@ def test_hitl_rejection_does_not_execute_escalation():
     assert "Ticket created" not in tool_messages[0].content
 
 
+
 def test_hitl_pause_survives_restart():
     """Verify paused state is preserved across new compiled instances over the same checkpointer."""
     checkpointer = MemorySaver()
@@ -152,3 +153,38 @@ def test_hitl_pause_survives_restart():
 
     state2 = app2.get_state(config)
     assert "sensitive_tools" in state2.next
+
+
+def test_hitl_parallel_mixed_calls_pause():
+    """Verify that a parallel message with BOTH safe and sensitive tools still pauses at sensitive_tools."""
+    # Model emits two parallel tool calls: a safe one + escalate_ticket
+    mock_response = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "query_service_health",
+                "args": {"service_name": "auth"},
+                "id": "call-safe-1",
+            },
+            {
+                "name": "escalate_ticket",
+                "args": {"ticket_title": "Auth failure", "severity": "P1"},
+                "id": "call-esc-5",
+            },
+        ],
+    )
+
+    workflow = create_agent_graph()
+    workflow.nodes["agent"].runnable = lambda state: {"messages": [mock_response]}
+    checkpointer = MemorySaver()
+    app = workflow.compile(checkpointer=checkpointer, interrupt_before=["sensitive_tools"])
+
+    config = {"configurable": {"thread_id": "hitl-parallel-test"}}
+    app.invoke({"messages": [HumanMessage(content="Auth is down, escalate now!")]}, config)
+
+    state = app.get_state(config)
+    # Must pause before sensitive_tools even though one call is safe
+    assert "sensitive_tools" in state.next
+    # No ToolMessage should have been created yet
+    assert not any(isinstance(m, ToolMessage) for m in state.values["messages"])
+

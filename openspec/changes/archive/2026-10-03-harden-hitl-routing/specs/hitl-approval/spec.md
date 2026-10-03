@@ -1,10 +1,6 @@
-# hitl-approval Specification
+# Spec Delta
 
-## Purpose
-
-Ensures sensitive incident triage actions, such as ticket creation and paging, require explicit human engineer approval before execution.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Sensitive actions require human approval
 The agent MUST pause before executing any message that contains at least one sensitive tool call. If ANY tool call in the message is `escalate_ticket`, the ENTIRE message MUST be routed to `sensitive_tools` and MUST NOT execute without explicit human approval. On rejection, the agent MUST receive a `ToolMessage` for EVERY pending tool call in the message so that graph state remains valid.

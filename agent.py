@@ -211,14 +211,14 @@ def execute_sensitive_tools(state: AgentState) -> dict[str, list[BaseMessage]]:
 
 
 def route_tools(state: AgentState) -> str:
-    """Route tool calls: sensitive_tools if escalate_ticket is present, else safe_tools, else END."""
+    """Route tool calls: sensitive_tools if ANY call is escalate_ticket, else safe_tools, else END."""
     last_message = state["messages"][-1]
     tool_calls = getattr(last_message, "tool_calls", [])
     if not tool_calls:
         return END
-    
-    # Check if first tool call is sensitive (per Change 3 roadmap)
-    if tool_calls[0]["name"] == "escalate_ticket":
+
+    # If ANY tool call is sensitive, pause for human approval
+    if any(tc["name"] == "escalate_ticket" for tc in tool_calls):
         return "sensitive_tools"
     return "safe_tools"
 
