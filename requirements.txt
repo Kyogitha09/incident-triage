@@ -3,6 +3,7 @@ uvicorn
 gradio
 langgraph
 langgraph-checkpoint-postgres
+google-generativeai
 langchain-google-genai
 langchain-core
 psycopg[binary,pool]
