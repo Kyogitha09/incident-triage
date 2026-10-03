@@ -1,123 +1,215 @@
 import os
 import json
+from typing import Annotated, Sequence, TypedDict, Any
 from dotenv import load_dotenv
-from typing import Annotated, Literal, TypedDict
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langgraph.graph import StateGraph, START, END
+from psycopg_pool import ConnectionPool
+from google import genai
+from google.genai import types
+
+from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage, AIMessage
+from langchain_core.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.postgres import PostgresSaver
-import psycopg
 
 load_dotenv()
 
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
+# Global connection pool cache
+_db_pool: ConnectionPool | None = None
 
-def query_service_health(service: str) -> str:
-    """Check the health status of a service."""
-    health_db = {
-        "auth": "Degraded - 504 timeouts detected",
-        "database": "Healthy",
-        "payments": "Healthy"
-    }
-    return health_db.get(service.lower(), f"Service {service} not found.")
 
-def search_remediation_runbooks(query: str, service: str = None) -> str:
-    """Search for incident remediation runbooks based on a query."""
-    embeddings = GoogleGenerativeAIEmbeddings(model="text-embedding-004", task_type="RETRIEVAL_QUERY")
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url: return "Database not configured."
-    
-    query_vector = embeddings.embed_query(query)
-    filter_json = json.dumps({"service": service}) if service else "{}"
-    
+def get_db_pool() -> ConnectionPool:
+    """Return a psycopg_pool ConnectionPool tuned for Supabase transaction pooler."""
+    global _db_pool
+    if _db_pool is None:
+        db_url = os.environ.get("DATABASE_URL")
+        if not db_url:
+            raise ValueError("DATABASE_URL environment variable is not set")
+        _db_pool = ConnectionPool(
+            db_url,
+            min_size=1,
+            max_size=10,
+            timeout=15,
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": None,
+            },
+        )
+    return _db_pool
+
+
+# Mock catalog for service health
+MOCK_SERVICE_CATALOG = {
+    "auth": {
+        "status": "degraded",
+        "error_rate": "18.4%",
+        "latency_p99": "2400ms",
+        "details": "Redis token cache connection timeout. Token refresh requests failing with 504.",
+    },
+    "database": {
+        "status": "degraded",
+        "error_rate": "4.2%",
+        "latency_p99": "4800ms",
+        "details": "High connection count nearing pool limit. Multiple long-running analytical queries.",
+    },
+    "payments": {
+        "status": "healthy",
+        "error_rate": "0.01%",
+        "latency_p99": "180ms",
+        "details": "All payment gateway webhooks and processing normal.",
+    },
+}
+
+
+@tool
+def query_service_health(service_name: str) -> str:
+    """Check the operational health and metrics of a backend service."""
+    service_key = service_name.strip().lower()
+    if service_key in MOCK_SERVICE_CATALOG:
+        data = MOCK_SERVICE_CATALOG[service_key]
+        return json.dumps({"service": service_key, **data})
+    return f"Service '{service_name}' not found in service health catalog. Known services: {list(MOCK_SERVICE_CATALOG.keys())}"
+
+
+@tool
+def search_remediation_runbooks(query: str, service: str | None = None) -> str:
+    """Search internal remediation runbooks by semantic similarity."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return "GEMINI_API_KEY is not configured."
+
     try:
-        with psycopg.connect(db_url, prepare_threshold=None) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT content FROM match_incident_docs(%s::vector, 2, %s::jsonb)",
-                    (query_vector, filter_json)
-                )
-                rows = cur.fetchall()
-                if not rows:
-                    return "No relevant runbooks found."
-                return "\n---\n".join([r[0] for r in rows])
+        client = genai.Client(api_key=api_key)
+        embed_result = client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=query,
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_QUERY",
+                output_dimensionality=768,
+            ),
+        )
+        query_embedding = embed_result.embeddings[0].values
     except Exception as e:
-        return f"Error searching runbooks: {e}"
+        return f"Failed to compute embedding for query: {e}"
 
-def escalate_ticket(ticket_title: str, severity: str, details: str) -> str:
-    """Escalate a critical incident to an engineer. ONLY call this if manual intervention is required."""
-    return f"Ticket created: {ticket_title} (Severity: {severity})"
+    filter_json = json.dumps({"service": service.lower()}) if service else "{}"
+    pool = get_db_pool()
 
-safe_tools = [query_service_health, search_remediation_runbooks]
-sensitive_tools = [escalate_ticket]
-all_tools = safe_tools + sensitive_tools
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT content, metadata, similarity
+                FROM match_incident_docs(%s::vector, %s::int, %s::jsonb);
+                """,
+                (query_embedding, 2, filter_json),
+            )
+            rows = cur.fetchall()
 
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0).bind_tools(all_tools)
+    if not rows:
+        return "No relevant runbooks found."
 
-def agent_node(state: AgentState):
-    sys_msg = SystemMessage(
-        content="You are an autonomous incident triage agent. "
-        "First check service health. Then search runbooks. "
-        "Escalate if manual intervention is needed or service stays degraded."
-    )
-    response = llm.invoke([sys_msg] + state["messages"])
+    results = []
+    for row in rows:
+        content, metadata, similarity = row
+        results.append(f"Runbook ({metadata.get('service', 'general')}): {content}")
+
+    return "\n\n".join(results)
+
+
+def extract_text(content: Any) -> str:
+    """Normalise message content (which could be string, list of dicts/blocks) to a plain string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item:
+                    parts.append(item["text"])
+                elif "content" in item:
+                    parts.append(str(item["content"]))
+                else:
+                    parts.append(json.dumps(item))
+            else:
+                parts.append(str(item))
+        return " ".join(parts).strip()
+    return str(content)
+
+
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+
+
+SYSTEM_PROMPT = (
+    "You are an Autonomous Incident Triage Agent. "
+    "When investigating an incident report:\n"
+    "1. FIRST ALWAYS inspect service health using `query_service_health` for any service mentioned or suspected.\n"
+    "2. THEN search remediation runbooks using `search_remediation_runbooks` for relevant recovery steps.\n"
+    "3. Finally, explain the findings, current operational health, and recommended remediation steps.\n"
+    "Be concise, analytical, and prioritize incident resolution."
+)
+
+SAFE_TOOLS = [query_service_health, search_remediation_runbooks]
+SAFE_TOOLS_BY_NAME = {t.name: t for t in SAFE_TOOLS}
+
+
+def call_model(state: AgentState) -> dict[str, list[BaseMessage]]:
+    """Invoke LLM with bound safe tools."""
+    llm = ChatGoogleGenerativeAI(model="gemini-3.8-flash", temperature=0.0)
+    llm_with_tools = llm.bind_tools(SAFE_TOOLS)
+    messages = list(state["messages"])
+    if not any(isinstance(m, SystemMessage) for m in messages):
+        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+    response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
-def route_tools(state: AgentState) -> Literal["safe_tools", "sensitive_tools", "__end__"]:
-    last_msg = state["messages"][-1]
-    if not last_msg.tool_calls:
-        return END
-    
-    # If ANY tool call is sensitive, route the whole batch to sensitive_tools (requires approval)
-    for tc in last_msg.tool_calls:
-        if tc["name"] in [t.__name__ for t in sensitive_tools]:
-            return "sensitive_tools"
-    
-    return "safe_tools"
 
-def execute_safe_tools(state: AgentState):
-    last_msg = state["messages"][-1]
-    results = []
-    for tc in last_msg.tool_calls:
-        if tc["name"] == "query_service_health":
-            res = query_service_health(**tc["args"])
-        elif tc["name"] == "search_remediation_runbooks":
-            res = search_remediation_runbooks(**tc["args"])
+def execute_safe_tools(state: AgentState) -> dict[str, list[BaseMessage]]:
+    """Execute tool calls requested by the model."""
+    last_message = state["messages"][-1]
+    tool_messages = []
+    for tool_call in getattr(last_message, "tool_calls", []):
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+        call_id = tool_call["id"]
+        target_tool = SAFE_TOOLS_BY_NAME.get(tool_name)
+        if target_tool:
+            result = target_tool.invoke(tool_args)
         else:
-            res = "Tool skipped."
-        results.append(ToolMessage(content=str(res), tool_call_id=tc["id"], name=tc["name"]))
-    return {"messages": results}
+            result = f"Error: Tool '{tool_name}' not available."
+        tool_messages.append(ToolMessage(content=str(result), tool_call_id=call_id))
+    return {"messages": tool_messages}
 
-def execute_sensitive_tools(state: AgentState):
-    last_msg = state["messages"][-1]
-    results = []
-    for tc in last_msg.tool_calls:
-        if tc["name"] == "escalate_ticket":
-            res = escalate_ticket(**tc["args"])
-        else:
-            res = "Tool skipped."
-        results.append(ToolMessage(content=str(res), tool_call_id=tc["id"], name=tc["name"]))
-    return {"messages": results}
 
-def build_graph():
-    builder = StateGraph(AgentState)
-    builder.add_node("agent", agent_node)
-    builder.add_node("safe_tools", execute_safe_tools)
-    builder.add_node("sensitive_tools", execute_sensitive_tools)
-    
-    builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", route_tools)
-    builder.add_edge("safe_tools", "agent")
-    builder.add_edge("sensitive_tools", "agent")
-    
-    return builder
+def route_tools(state: AgentState) -> str:
+    """Route to safe_tools if tool calls exist, else END."""
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return "safe_tools"
+    return END
 
-def get_agent_app(pool=None):
-    graph = build_graph()
-    if pool:
-        checkpointer = PostgresSaver(pool)
-        checkpointer.setup()
-        return graph.compile(checkpointer=checkpointer, interrupt_before=["sensitive_tools"])
-    return graph.compile(interrupt_before=["sensitive_tools"])
+
+def create_agent_graph():
+    """Build the LangGraph state graph."""
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", call_model)
+    workflow.add_node("safe_tools", execute_safe_tools)
+
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", route_tools, {"safe_tools": "safe_tools", END: END})
+    workflow.add_edge("safe_tools", "agent")
+
+    return workflow
+
+
+def get_agent_app(pool: ConnectionPool | None = None):
+    """Return the compiled agent graph with Postgres checkpointer."""
+    active_pool = pool or get_db_pool()
+    checkpointer = PostgresSaver(active_pool)
+    checkpointer.setup()
+    workflow = create_agent_graph()
+    return workflow.compile(checkpointer=checkpointer)
